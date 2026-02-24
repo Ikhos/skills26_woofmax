@@ -8,10 +8,24 @@ from bruno.auth.face_embed import FaceEmbedID
 from bruno.auth.pin import verify_pin, set_pin, pin_exists
 from bruno.storage.users import ensure_user_dirs, save_scan_json
 from bruno.voice.tts import speak
+from bruno.voice.stt_whisper import listen_and_transcribe  # ✅ ADDED
 from bruno.brain.orchestrator import think_sync
 from bruno.brainloop.state import build_state
 from bruno.brainloop.risk import score_risk
 from bruno.brainloop.autopilot import Autopilot
+
+import threading
+
+latest_transcript = None
+voice_lock = threading.Lock()
+
+def voice_worker():
+    global latest_transcript
+    while True:
+        text = listen_and_transcribe(4.0)
+        if text:
+            with voice_lock:
+                latest_transcript = text
 
 USERS_ROOT = "data/users"
 
@@ -23,10 +37,8 @@ def draw_boxes(frame, detections, name_map=None):
         tid = d.get("track_id")
         tag = f"{label}" if tid is None else f"{label} #{tid}"
 
-        # Draw green box
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        # Draw object label
         cv2.putText(
             frame,
             tag,
@@ -37,7 +49,6 @@ def draw_boxes(frame, detections, name_map=None):
             2,
         )
 
-        # Draw recognized name above PERSON box
         if name_map and label == "person":
             uid = name_map.get(tuple([x1, y1, x2, y2]))
             if uid:
@@ -54,7 +65,6 @@ def draw_boxes(frame, detections, name_map=None):
     return frame
 
 
-
 def center_of(box):
     x1,y1,x2,y2 = box
     return ((x1+x2)//2, (y1+y2)//2)
@@ -64,7 +74,6 @@ def point_in_box(px, py, box):
     return x1 <= px <= x2 and y1 <= py <= y2
 
 def assign_names_to_person_boxes(detections, face_matches):
-    # Returns dict: person_box_tuple -> user_id
     persons = [d for d in detections if d.get("label") == "person" and "box" in d]
     mapping = {}
     if not persons or not face_matches:
@@ -77,7 +86,6 @@ def assign_names_to_person_boxes(detections, face_matches):
         fx1,fy1,fx2,fy2 = fm["bbox"]
         cx, cy = center_of([fx1,fy1,fx2,fy2])
 
-        # pick the person box that contains the face center, prefer smallest area (closest fit)
         candidates = []
         for d in persons:
             pb = d["box"]
@@ -104,13 +112,26 @@ def best_person_box(detections):
 
 
 def main():
+    global latest_transcript
     print("🐶 BRUNO booting...")
+    
     cap = open_camera(index=0)
+    # -------- LOCK EXPOSURE (CRITICAL FOR rPPG) --------
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # disable auto exposure
+    cap.set(cv2.CAP_PROP_EXPOSURE, -6)         # adjust if image too dark/bright
+    # ---------------------------------------------------
+
     yolo = YOLOTracker()
     pose = PoseAnalyzer()
     faceid = FaceEmbedID(USERS_ROOT)
     autopilot = Autopilot()
     autopilot_enabled = True
+
+    voice_thread = threading.Thread(target=voice_worker, daemon=True)
+    voice_thread.start()
+
+    BRAIN_COOLDOWN_SEC = 4.0
+    last_brain_speak_time = 0.0
 
     print("BRUNO: Keys:")
     print("  n = new profile (create user + PIN)")
@@ -120,29 +141,20 @@ def main():
     print("  a = toggle autopilot")
     print("  q = quit")
 
-    # Loop tuning
     frame_count = 0
     OBJ_EVERY_N = 4
     ID_EVERY_N = 4
     POSE_EVERY_N = 3
 
-    # --- Identity smoothing ---
-    ID_GRACE_SEC = 2.5          # keep last known name for a track for this long
-    SPEAK_COOLDOWN_SEC = 2.0    # prevent spam
-    track_identity = {}         # track_id -> {"name": str|None, "last_seen": float, "conf": float}
+    ID_GRACE_SEC = 2.5
+    SPEAK_COOLDOWN_SEC = 2.0
+    track_identity = {}
     last_spoken = {"t": 0.0, "name": None}
 
-
-    # Detections cache
     last_detections = []
-
-    # Face matches cache (for always-on display)
     last_face_matches = []
-
-    # Pose cache (we keep fall_score in the data, but we do NOTHING with it)
     last_pose = {"detected": False, "fall_score": 0.0, "keypoints": None, "notes": {}}
 
-    # Display identity (UI only, no access)
     display_user = None
     display_until = 0.0
     DISPLAY_TTL = 3.0
@@ -152,7 +164,6 @@ def main():
 
     last_spoken_user = None
 
-    # Authorization identity (data access)
     authorized_user = None
     auth_until = 0.0
     AUTH_TTL = 25.0
@@ -163,7 +174,42 @@ def main():
             continue
 
         frame_count += 1
+        
+        with voice_lock:
+            transcript = latest_transcript
+            latest_transcript = None
 
+        if transcript:
+            print("Heard:", transcript)
+            normalized = transcript.lower().strip()
+
+            # ---------------- SKIN TRIGGER ----------------
+            if "check my skin" in normalized:
+                brain_out = think_sync(
+                    {"transcript": transcript},
+                    frame=frame
+                )
+
+                if brain_out and brain_out.get("say"):
+                    speak(brain_out["say"])
+
+         # ---------------- HEART RATE TRIGGER ----------------
+            elif "check my heart rate" in normalized:
+                face_box = (
+                    last_face_matches[0]["bbox"]
+                    if last_face_matches else None
+                )
+
+                brain_out = think_sync(
+                    {"transcript": transcript},
+                    frame=frame,
+                    cap=cap,
+                   face_box=face_box
+               )
+
+                if brain_out and brain_out.get("say"):
+                    speak(brain_out["say"])
+        
         # Object detection
         if frame_count % OBJ_EVERY_N == 0:
             try:
@@ -267,12 +313,8 @@ def main():
         )
         risk = score_risk(state)
         if autopilot_enabled:
-            out = autopilot.decide(state, risk)
-            if out.say:
-                try:
-                    speak(out.say)
-                except Exception:
-                    pass
+            # 🔕 Keep risk logic but disable speech
+            autopilot.decide(state, risk)
 
         
         # --- Primary identity speech gate (no spam + no instant 'not recognized') ---

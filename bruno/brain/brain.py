@@ -1,4 +1,8 @@
+# bruno/brain/speaker.py
+
 import json
+from bruno.voice.tts import speak
+
 
 class BrunoBrain:
     def __init__(self):
@@ -27,3 +31,33 @@ class BrunoBrain:
             return base + f" Hello {user}. Would you like a health check or environment safety scan?"
         else:
             return base + " Would you like me to identify you for personalized assistance?"
+
+
+# ---------------------------------------------------
+# 🔥 ADD THIS FUNCTION (DO NOT REMOVE YOUR CLASS)
+# ---------------------------------------------------
+
+def speak_response(event, vision_data=None, routing=None):
+    """
+    Adapter layer so orchestrator can call speaker cleanly.
+    """
+
+    brain = BrunoBrain()
+
+    transcript = event.get("transcript", "")
+
+    # Vision data expected format:
+    # { "counts": {...} }
+    scene_summary = vision_data if vision_data else {}
+
+    context = brain.build_context(
+        scene_summary=scene_summary,
+        user_id=None,
+        health_data=None
+    )
+
+    response = brain.generate_response(context)
+
+    speak(response)
+
+    return {"say": response}

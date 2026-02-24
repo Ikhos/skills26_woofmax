@@ -5,7 +5,7 @@ from faster_whisper import WhisperModel
 import tempfile
 import os
 
-_MODEL_NAME = "base"
+_MODEL_NAME = "tiny"
 _model = None
 
 def _get_model():
