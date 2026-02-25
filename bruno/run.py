@@ -1,14 +1,35 @@
 import cv2
 import time
+import os
 
 from bruno.utils.camera import open_camera, read_frame, close_camera
-from bruno.perception.yolo import YOLOTracker
-from bruno.perception.pose import PoseAnalyzer, draw_pose_skeleton_in_bbox
-from bruno.auth.face_embed import FaceEmbedID
+
+# Pi / ARM: use stubs if heavy libs cause "Illegal Instruction" (set after running scripts/check_pi_imports.py)
+# BRUNO_PI=1 disables all heavy libs at once to get the app running on Raspberry Pi.
+_def = os.environ.get("BRUNO_PI", "").strip().lower() in ("1", "true", "yes")
+if _def or os.environ.get("BRUNO_DISABLE_POSE"):
+    from bruno.perception.pose_stub import PoseAnalyzer, draw_pose_skeleton_in_bbox
+else:
+    from bruno.perception.pose import PoseAnalyzer, draw_pose_skeleton_in_bbox
+
+if _def or os.environ.get("BRUNO_DISABLE_FACEID"):
+    from bruno.auth.face_embed_stub import FaceEmbedID
+else:
+    from bruno.auth.face_embed import FaceEmbedID
+
+if _def or os.environ.get("BRUNO_DISABLE_YOLO"):
+    from bruno.perception.yolo_stub import YOLOTracker
+else:
+    from bruno.perception.yolo import YOLOTracker
+
 from bruno.auth.pin import verify_pin, set_pin, pin_exists
 from bruno.storage.users import ensure_user_dirs, save_scan_json
 from bruno.voice.tts import speak
-from bruno.voice.stt_whisper import listen_and_transcribe  # ✅ ADDED
+if not _def and not os.environ.get("BRUNO_DISABLE_WHISPER"):
+    from bruno.voice.stt_whisper import listen_and_transcribe
+else:
+    def listen_and_transcribe(seconds=4.0):
+        return ""
 from bruno.brain.orchestrator import think_sync
 from bruno.brainloop.state import build_state
 from bruno.brainloop.risk import score_risk
@@ -127,8 +148,9 @@ def main():
     autopilot = Autopilot()
     autopilot_enabled = True
 
-    voice_thread = threading.Thread(target=voice_worker, daemon=True)
-    voice_thread.start()
+    if not _def and not os.environ.get("BRUNO_DISABLE_WHISPER"):
+        voice_thread = threading.Thread(target=voice_worker, daemon=True)
+        voice_thread.start()
 
     BRAIN_COOLDOWN_SEC = 4.0
     last_brain_speak_time = 0.0
